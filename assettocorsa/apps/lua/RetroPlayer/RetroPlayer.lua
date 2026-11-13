@@ -1,16 +1,76 @@
 --------------------------------------------------------------------------------
--- RETRO PLAYER v3.2 - app Lua (CSP) para Assetto Corsa
--- MP3/M4A/AAC/WAV | estações por pasta | visualizador pseudo-rítmico
--- skins Winamp / Rádio automotivo | cor RGB + saturação + brilho
--- v3.2: janela responsiva, corpo do aparelho preenche a janela inteira
+-- RETRO PLAYER v4.2 - app Lua (CSP) para Assetto Corsa
+-- Visual e skins da v3.2 + Espectro Real FFT via FFmpeg da v4.1 (com fallback)
+-- MP3/M4A/AAC/WAV | estações por pasta | skins Winamp / Rádio automotivo
+-- cor RGB + saturação + brilho | janela 100% responsiva
 --------------------------------------------------------------------------------
 
 local EXTENSIONS = { mp3 = true, m4a = true, wav = true, aac = true }
+local BARS = 24
+
+--------------------------------------------------------------------------------
+-- utilidades e caminhos
+--------------------------------------------------------------------------------
+local function safe(f)
+  local ok, r = pcall(f)
+  if ok then return r end
+  return nil
+end
+
+local function log(m)
+  pcall(ac.log, 'RetroPlayer: ' .. tostring(m))
+end
+
+local function clamp(x, a, b)
+  if x < a then return a elseif x > b then return b end
+  return x
+end
+
+local function clamp01(v)
+  return math.max(0, math.min(1, v))
+end
+
+local function dirExists(p)
+  if io.dirExists then
+    local ok, r = pcall(io.dirExists, p)
+    if ok then return r and true or false end
+  end
+  if io.isDirectory then
+    local ok, r = pcall(io.isDirectory, p)
+    if ok then return r and true or false end
+  end
+  return false
+end
+
+local function fileExists(p)
+  if not p or p == '' then return false end
+  if io.fileExists then
+    local ok, r = pcall(io.fileExists, p)
+    if ok then return r and true or false end
+  end
+  local ok, r = pcall(io.getAttributes, p)
+  return ok and r ~= nil and r ~= false
+end
+
+local function normPath(p)
+  p = tostring(p or ''):gsub('\\', '/')
+  p = p:gsub('/+$', '')
+  return p
+end
 
 local function rootFolder()
-  local ok, p = pcall(function() return ac.getFolder(ac.FolderID.Root) end)
-  return (ok and p and p ~= '') and p or 'C:'
+  local p = safe(function() return ac.getFolder(ac.FolderID.Root) end)
+  return (p and p ~= '') and p or 'C:'
 end
+
+local AC_ROOT = normPath(rootFolder())
+local APP_DIR = safe(function() return ac.getFolder(ac.FolderID.ScriptOrigin) end)
+if not APP_DIR or APP_DIR == '' or not dirExists(APP_DIR) then
+  local apps = safe(function() return ac.getFolder(ac.FolderID.ACApps) end) or (AC_ROOT .. '/apps')
+  APP_DIR = apps .. '/lua/RetroPlayer'
+end
+APP_DIR = normPath(APP_DIR)
+local CACHE = APP_DIR .. '/cache'
 
 local cfg = ac.storage{
   root = rootFolder() .. '\\music',
@@ -25,12 +85,10 @@ local cfg = ac.storage{
   bright = 1.0,             -- multiplicador de brilho (0.3..1.5)
   bpmManual = 0,            -- 0 = automático
   intensity = 1.0,          -- intensidade do pulso (0.3..1.5)
+  realSpectrum = true,      -- usa FFT via ffmpeg quando disponível
+  ffmpeg = APP_DIR .. '/bin/ffmpeg.exe',
+  sensitivity = 6,          -- ganho em dB do espectro real
 }
-
---------------------------------------------------------------------------------
--- utilidades
---------------------------------------------------------------------------------
-local function clamp01(v) return math.max(0, math.min(1, v)) end
 
 local function hashStr(s)
   local h = 0
@@ -44,7 +102,7 @@ local function fmtTime(t)
 end
 
 --------------------------------------------------------------------------------
--- COR: RGB -> HSV -> paleta
+-- COR: RGB -> HSV -> paleta (v3.2)
 --------------------------------------------------------------------------------
 local function rgb2hsv(r, g, b)
   local mx, mn = math.max(r, g, b), math.min(r, g, b)
@@ -117,6 +175,107 @@ local function grad(segs)
 end
 
 --------------------------------------------------------------------------------
+-- MOTOR FFT + ANÁLISE FFMPEG (v4.1)
+--------------------------------------------------------------------------------
+local N, SR = 1024, 11025
+local RE, IM, WIN, REV, COS, SIN = {}, {}, {}, {}, {}, {}
+local BLO, BHI, TILT = {}, {}, {}
+local pcm = { status = 'idle', data = nil, token = 0, msg = '' }
+
+local function initFFT()
+  local bits = 10
+  for i = 0, N - 1 do
+    local r, x = 0, i
+    for _ = 1, bits do r = r * 2 + (x % 2); x = math.floor(x / 2) end
+    REV[i] = r
+    WIN[i + 1] = 0.5 - 0.5 * math.cos(2 * math.pi * i / (N - 1))
+    RE[i + 1] = 0
+    IM[i + 1] = 0
+  end
+  for k = 0, N / 2 - 1 do
+    COS[k + 1] = math.cos(2 * math.pi * k / N)
+    SIN[k + 1] = -math.sin(2 * math.pi * k / N)
+  end
+  local fmin, fmax = 50, 5000
+  for b = 1, BARS do
+    local f0 = fmin * (fmax / fmin) ^ ((b - 1) / BARS)
+    local f1 = fmin * (fmax / fmin) ^ (b / BARS)
+    local k0 = math.max(1, math.floor(f0 * N / SR + 0.5))
+    local k1 = math.max(k0, math.floor(f1 * N / SR))
+    BLO[b], BHI[b] = k0, k1
+    TILT[b] = 3 * math.log(math.sqrt(f0 * f1) / 50) / math.log(2)
+  end
+end
+
+local function fftRun()
+  local size = 2
+  while size <= N do
+    local half = size / 2
+    local step = N / size
+    for start = 0, N - 1, size do
+      local k = 0
+      for j = start, start + half - 1 do
+        local wr, wi = COS[k + 1], SIN[k + 1]
+        local a, b = j + 1, j + half + 1
+        local xr, xi = RE[b], IM[b]
+        local tr = xr * wr - xi * wi
+        local ti = xr * wi + xi * wr
+        RE[b] = RE[a] - tr; IM[b] = IM[a] - ti
+        RE[a] = RE[a] + tr; IM[a] = IM[a] + ti
+        k = k + step
+      end
+    end
+    size = size * 2
+  end
+end
+
+local function startAnalysis(tr)
+  pcm.token = pcm.token + 1
+  pcm.data = nil
+  pcm.msg = ''
+  local token = pcm.token
+  if not cfg.realSpectrum then pcm.status = 'off'; return end
+  if not tr or not tr.path then pcm.status = 'idle'; return end
+  if not fileExists(cfg.ffmpeg) then pcm.status = 'missing'; return end
+
+  pcm.status = 'decoding'
+  pcall(io.createDir, CACHE)
+  local out = CACHE .. '/track_' .. token .. '.pcm'
+
+  local ok, e = pcall(function()
+    os.runConsoleProcess({
+      filename = cfg.ffmpeg,
+      arguments = {
+        '-hide_banner', '-v', 'error', '-y',
+        '-i', tr.path, '-vn',
+        '-ac', '1', '-ar', tostring(SR), '-f', 's16le', out
+      },
+      workingDirectory = APP_DIR,
+    }, function(err, data)
+      if token ~= pcm.token then pcall(io.deleteFile, out); return end
+      local s = safe(function() return io.load(out) end)
+      if type(s) == 'string' and #s > N * 4 then
+        pcm.data = s
+        pcm.status = 'ready'
+      else
+        pcm.status = 'error'
+        local m = err and tostring(err) or ''
+        if type(data) == 'table' then m = m .. ' ' .. tostring(data.stderr or data.stdout or '') end
+        pcm.msg = m
+        log('ffmpeg falhou: ' .. m)
+      end
+      pcall(io.deleteFile, out)
+    end)
+  end)
+
+  if not ok then
+    pcm.status = 'error'
+    pcm.msg = tostring(e)
+    log('runConsoleProcess: ' .. tostring(e))
+  end
+end
+
+--------------------------------------------------------------------------------
 -- biblioteca (pasta principal -> estações)
 --------------------------------------------------------------------------------
 local library = {}
@@ -129,7 +288,7 @@ local function tryAddFile(name, full, list)
 end
 
 local function sortedItems(dir)
-  local items = io.scanDir(dir, '*') or {}
+  local items = safe(function() return io.scanDir(dir, '*') end) or {}
   table.sort(items, function(a, b) return a:lower() < b:lower() end)
   return items
 end
@@ -138,7 +297,7 @@ local function collect(dir, list, depth)
   for _, name in ipairs(sortedItems(dir)) do
     if name ~= '.' and name ~= '..' then
       local full = dir .. '\\' .. name
-      if io.dirExists(full) then
+      if dirExists(full) then
         if depth < 4 then collect(full, list, depth + 1) end
       else
         tryAddFile(name, full, list)
@@ -150,12 +309,12 @@ end
 local function rescan()
   local root = cfg.root
   local newLib, all, rootFiles = {}, {}, {}
-  if not io.dirExists(root) then pcall(io.createDir, root) end
-  if io.dirExists(root) then
+  if not dirExists(root) then pcall(io.createDir, root) end
+  if dirExists(root) then
     for _, name in ipairs(sortedItems(root)) do
       if name ~= '.' and name ~= '..' then
         local full = root .. '\\' .. name
-        if io.dirExists(full) then
+        if dirExists(full) then
           local tracks = {}
           collect(full, tracks, 1)
           if #tracks > 0 then newLib[#newLib + 1] = { name = name:upper(), tracks = tracks } end
@@ -185,14 +344,24 @@ local function currentList()
   local c = library[cfg.folder]
   return c and c.tracks or {}
 end
-local function currentTrack() return currentList()[current] end
+
+local function currentTrack()
+  return currentList()[current]
+end
+
+local function playbackTimes()
+  if player and state ~= 'stopped' then
+    local ok, t, d = pcall(function() return player:currentTime(), player:duration() end)
+    if ok then return t or 0, d or 0 end
+  end
+  return 0, 0
+end
 
 local function setVolume(v)
   cfg.volume = clamp01(v)
-  if player then player:setVolume(cfg.volume) end
+  if player then pcall(function() player:setVolume(cfg.volume) end) end
 end
 
--- BPM automático: lido do nome (ex.: "128 bpm") ou gerado pelo hash do título
 local function guessBpm(title)
   local n = tonumber(title:lower():match('(%d%d%d?)%s*bpm'))
   if n and n >= 60 and n <= 220 then return n end
@@ -217,10 +386,11 @@ local function playTrack(i)
   trackSeed = hashStr(t.title)
   trackBpm = guessBpm(t.title)
   trackPattern = 1 + trackSeed % 3
+  startAnalysis(t)
 end
 
 local function stopPlayback()
-  if player then player:pause(); player:setCurrentTime(0) end
+  if player then pcall(function() player:pause(); player:setCurrentTime(0) end) end
   state = 'stopped'
 end
 
@@ -238,8 +408,9 @@ local function nextTrack(auto)
 end
 
 local function prevTrack()
-  if player and state ~= 'stopped' and player:currentTime() > 3 then
-    player:setCurrentTime(0)
+  local curT = playbackTimes()
+  if player and state ~= 'stopped' and curT > 3 then
+    pcall(function() player:setCurrentTime(0) end)
   else
     playTrack(current > 0 and current - 1 or #currentList())
   end
@@ -275,11 +446,8 @@ local function stepFolder(d)
 end
 
 --------------------------------------------------------------------------------
--- VISUALIZADOR PSEUDO-RÍTMICO
--- Simula bumbo / caixa / chimbal em passos de 16avos, com "energia" variando
--- a cada 4 compassos. Graves -> bumbo, médios -> caixa, agudos -> chimbal.
+-- VISUALIZADOR (FFT Real + Fallback Pseudo-Rítmico da v3.2)
 --------------------------------------------------------------------------------
-local BARS = 24
 local lvl, peak, peakHold = {}, {}, {}
 local noisePh, noiseFr = {}, {}
 for i = 1, BARS do
@@ -300,15 +468,15 @@ local function triggerStep(step)
   local bar = math.floor(step / 16)
   local kick, snare, hat = false, false, 0
 
-  if trackPattern == 1 then            -- eletrônico (4 por 4)
+  if trackPattern == 1 then             -- eletrônico (4 por 4)
     kick  = (s % 4 == 0)
     snare = (s == 4 or s == 12)
     hat   = (s % 4 == 2) and 1 or ((s % 2 == 0) and 0.4 or 0.15)
-  elseif trackPattern == 2 then        -- rock
+  elseif trackPattern == 2 then         -- rock
     kick  = (s == 0 or s == 8 or (s == 10 and bar % 2 == 1))
     snare = (s == 4 or s == 12)
     hat   = (s % 2 == 0) and 0.8 or 0
-  else                                 -- quebrado / hip-hop
+  else                                  -- quebrado / hip-hop
     kick  = (s == 0 or s == 7 or s == 10 or (s == 14 and bar % 4 == 3))
     snare = (s == 4 or s == 12)
     hat   = (s % 2 == 0) and 0.7 or (math.random() < 0.5 and 0.35 or 0)
@@ -324,8 +492,66 @@ local function triggerStep(step)
   if s == 0 and bar % 4 == 0 then energyTarget = 0.55 + math.random() * 0.45 end
 end
 
+local function applyBarSmoothing(i, target, dt)
+  if target > lvl[i] then
+    lvl[i] = lvl[i] + (target - lvl[i]) * math.min(1, dt * 35)
+  else
+    lvl[i] = math.max(target, lvl[i] - dt * 2.2)
+  end
+
+  if lvl[i] >= peak[i] then
+    peak[i], peakHold[i] = lvl[i], 0.35
+  else
+    peakHold[i] = peakHold[i] - dt
+    if peakHold[i] < 0 then peak[i] = math.max(lvl[i], peak[i] - dt * 0.9) end
+  end
+end
+
+local function updateRealFFT(t, dt)
+  local s = pcm.data
+  local total = math.floor(#s / 2)
+  local start = math.floor(t * SR) - math.floor(N / 2)
+  if start < 0 then start = 0 end
+  if start + N > total then
+    for i = 1, BARS do applyBarSmoothing(i, 0, dt) end
+    return
+  end
+
+  local bt = { s:byte(start * 2 + 1, (start + N) * 2) }
+  for i = 0, N - 1 do
+    local v = (bt[2 * i + 1] or 0) + (bt[2 * i + 2] or 0) * 256
+    if v >= 32768 then v = v - 65536 end
+    local r = REV[i] + 1
+    RE[r] = v / 32768 * WIN[i + 1]
+    IM[r] = 0
+  end
+
+  fftRun()
+
+  local sens = cfg.sensitivity
+  local norm = 4 / N
+  for b = 1, BARS do
+    local m = 0
+    for k = BLO[b], BHI[b] do
+      local re, im = RE[k + 1], IM[k + 1]
+      local a = re * re + im * im
+      if a > m then m = a end
+    end
+    local amp = math.sqrt(m) * norm
+    local db = 20 * math.log10(amp + 1e-9) + TILT[b] + sens
+    local target = clamp01((db + 48) / 42)
+    applyBarSmoothing(b, target, dt)
+  end
+end
+
 local function updateSpectrum(dt)
   local active = (state == 'playing')
+
+  if active and cfg.realSpectrum and pcm.status == 'ready' and pcm.data then
+    local curT = playbackTimes()
+    updateRealFFT(curT, dt)
+    return
+  end
 
   if active then
     beatPhase = beatPhase + dt * activeBpm() / 60
@@ -357,19 +583,7 @@ local function updateSpectrum(dt)
               + 0.08 + math.random() * 0.05
       target = clamp01(v * (0.55 + 0.6 * energy) * inten)
     end
-
-    if target > lvl[i] then
-      lvl[i] = lvl[i] + (target - lvl[i]) * math.min(1, dt * 35)
-    else
-      lvl[i] = math.max(target, lvl[i] - dt * 1.8)
-    end
-
-    if lvl[i] >= peak[i] then
-      peak[i], peakHold[i] = lvl[i], 0.35
-    else
-      peakHold[i] = peakHold[i] - dt
-      if peakHold[i] < 0 then peak[i] = math.max(lvl[i], peak[i] - dt * 0.9) end
-    end
+    applyBarSmoothing(i, target, dt)
   end
 end
 
@@ -377,8 +591,9 @@ function script.update(dt)
   clock = clock + dt
   if advanceLock > 0 then advanceLock = advanceLock - dt end
   if player and state == 'playing' and advanceLock <= 0 then
-    local dur = player:duration()
-    if player:ended() or (dur > 1 and player:currentTime() >= dur - 0.15) then nextTrack(true) end
+    local curT, dur = playbackTimes()
+    local ended = safe(function() return player:ended() end)
+    if ended or (dur > 1 and curT >= dur - 0.15) then nextTrack(true) end
   end
   updateSpectrum(dt)
   if state == 'playing' then
@@ -387,13 +602,11 @@ function script.update(dt)
 end
 
 --------------------------------------------------------------------------------
--- helpers de desenho (com escala)
--- Tudo é desenhado em coordenadas LOCAIS da janela (origem 0,0 = canto
--- superior esquerdo da janela, incluindo o padding).
+-- helpers de desenho (com escala - v3.2)
 --------------------------------------------------------------------------------
-local DW, DH = 560, 190          -- dimensões de projeto do player
-local SX, SY = 1, 1              -- escala atual
-local OX, OY = 0, 0              -- origem do player dentro da janela
+local DW, DH = 560, 190           -- dimensões de projeto do player
+local SX, SY = 1, 1               -- escala atual
+local OX, OY = 0, 0               -- origem do player dentro da janela
 local BODY = { w = 560, h = 190 } -- tamanho total da janela (para o corpo)
 
 local function P(x, y) return vec2(OX + x * SX, OY + y * SY) end
@@ -415,7 +628,6 @@ local function ctext(s, size, cx, cy, col)
   txt(s, size, cx - m.x / (2 * math.max(0.001, SX)), cy - m.y / (2 * math.max(0.001, SY)), col)
 end
 
--- corpo do aparelho: preenche a janela inteira (cobre padding e faixas laterais)
 local function fillBody(top, bot, highlight)
   ui.drawRectFilledMultiColor(vec2(0, 0), vec2(BODY.w, BODY.h), top, top, bot, bot)
   ui.drawLine(vec2(0, 1), vec2(BODY.w, 1), rgbm(1, 1, 1, highlight), 1)
@@ -464,7 +676,6 @@ local function drawSeg7(text, x, y, dw, dh, t, gap)
   end
 end
 
--- L / PK opcionais (usados na pré-visualização da config)
 local function drawSpectrum(x, y, w, h, segs, gap, L, PK)
   L, PK = L or lvl, PK or peak
   local bw = (w - gap * (BARS - 1)) / BARS
@@ -539,11 +750,6 @@ local function iconText(s) return function(cx, cy, c) ctext(s, 12, cx, cy, c) en
 local iconShuf, iconRep = iconText('SHUF'), iconText('REP')
 local iconDirM, iconDirP = iconText('DIR-'), iconText('DIR+')
 
-local function playbackTimes()
-  if player and state ~= 'stopped' then return player:currentTime(), player:duration() end
-  return 0, 0
-end
-
 local function marqueeText()
   local tr = currentTrack()
   if tr then return string.format('%02d. %s', current, tr.title):upper() end
@@ -554,7 +760,9 @@ end
 local function seekBar(x, y, w, h)
   local cur, dur = playbackTimes()
   local f, released = slider('seek', x, y, w, h, (dur > 0) and clamp01(cur / dur) or 0)
-  if released and f and player and dur > 0 and state ~= 'stopped' then player:setCurrentTime(f * dur) end
+  if released and f and player and dur > 0 and state ~= 'stopped' then
+    pcall(function() player:setCurrentTime(f * dur) end)
+  end
 end
 
 local function timeDisplay(x, y, dw, dh, t, gap, hitW)
@@ -566,8 +774,20 @@ local function timeDisplay(x, y, dw, dh, t, gap, hitW)
   if ui.invisibleButton('timeToggle', vec2(hitW * SX, (dh + 4) * SY)) then cfg.showRemaining = not cfg.showRemaining end
 end
 
+local function eqModeText(winampStyle)
+  if state ~= 'playing' then return 'EQ' end
+  if cfg.realSpectrum then
+    if pcm.status == 'ready' then return 'FFT' end
+    if pcm.status == 'decoding' then return 'FFT..' end
+  end
+  if winampStyle then
+    return string.format('%d BPM', math.floor(activeBpm() + 0.5))
+  end
+  return 'EQ'
+end
+
 --------------------------------------------------------------------------------
--- SKIN 1: WINAMP
+-- SKIN 1: WINAMP (v3.2)
 --------------------------------------------------------------------------------
 local function drawWinamp()
   local tr, cat = currentTrack(), library[cfg.folder]
@@ -586,8 +806,7 @@ local function drawWinamp()
   txt('REP', 13, 304, 22, cfg.repeatAll and PAL.text or PAL.dim)
   txt('> ' .. (cat and cat.name:sub(1, 15) or 'SEM PASTA'), 15, 172, 44, PAL.on)
   if cat and current > 0 then txt(string.format('%03d/%03d', current, #cat.tracks), 13, 172, 64, PAL.dim) end
-  txt(state == 'playing' and string.format('%d BPM', math.floor(activeBpm() + 0.5)) or 'EQ', 13, 246, 64,
-      state == 'playing' and PAL.text or PAL.dim)
+  txt(eqModeText(true), 13, 246, 64, state == 'playing' and PAL.text or PAL.dim)
 
   drawSpectrum(332, 20, 204, 56, 12, 2)
 
@@ -613,7 +832,7 @@ local function drawWinamp()
 end
 
 --------------------------------------------------------------------------------
--- SKIN 2: RÁDIO AUTOMOTIVO
+-- SKIN 2: RÁDIO AUTOMOTIVO (v3.2)
 --------------------------------------------------------------------------------
 local knobDrag = 0
 
@@ -703,7 +922,7 @@ local function drawRadio()
   txt(state == 'playing' and 'PLAY' or (state == 'paused' and 'PAUSE' or 'STOP'), 11, 398, 40, PAL.text)
   txt('SHUF', 11, 398, 54, cfg.shuffle and PAL.text or PAL.dim)
   txt('REP', 11, 438, 54, cfg.repeatAll and PAL.text or PAL.dim)
-  txt('EQ', 11, 398, 68, state == 'playing' and PAL.text or PAL.dim)
+  txt(eqModeText(false), 11, 398, 68, state == 'playing' and PAL.text or PAL.dim)
   if cat and current > 0 then txt(string.format('%d/%d', current, #cat.tracks), 10, 430, 68, PAL.dim) end
   txt('> ' .. (cat and cat.name:sub(1, 30) or 'SEM PASTA'), 12, 202, 86, PAL.on)
 
@@ -734,7 +953,6 @@ end
 function script.windowMain(dt)
   updatePalette()
 
-  -- tamanho total da janela (inclui padding). Fallback: espaço disponível.
   local winW, winH = DW, DH
   local ok, sz = pcall(function() return ui.windowSize() end)
   if ok and sz and type(sz.x) == 'number' and sz.x > 1 and sz.y > 1 then
@@ -748,13 +966,11 @@ function script.windowMain(dt)
 
   BODY.w, BODY.h = winW, winH
 
-  -- escala uniforme + centralização na janela inteira (origem em 0,0)
   local s = math.max(math.min(winW / DW, winH / DH), 0.15)
   SX, SY = s, s
   OX = (winW - DW * s) * 0.5
   OY = (winH - DH * s) * 0.5
 
-  -- amplia a área de recorte para a janela toda (senão o padding é cortado)
   pcall(ui.pushClipRect, vec2(0, 0), vec2(winW, winH), false)
 
   ui.pushDWriteFont('Consolas')
@@ -768,7 +984,7 @@ function script.windowMain(dt)
 end
 
 --------------------------------------------------------------------------------
--- JANELA DA PLAYLIST
+-- JANELA DA PLAYLIST (v3.2)
 --------------------------------------------------------------------------------
 function script.windowPlaylist(dt)
   ui.text('Pasta principal:')
@@ -797,7 +1013,7 @@ function script.windowPlaylist(dt)
 end
 
 --------------------------------------------------------------------------------
--- JANELA DE CONFIGURAÇÃO (tema, cor, pulso)
+-- JANELA DE CONFIGURAÇÃO (v3.2 + controles FFmpeg da v4.1)
 --------------------------------------------------------------------------------
 local PRESETS = {
   { 'Roxo', 209, 115, 255 }, { 'Azul', 70, 150, 255 }, { 'Vermelho', 255, 70, 90 },
@@ -837,14 +1053,18 @@ function script.windowConfig(dt)
   ui.text(string.format('Base: H %.0f  S %.0f%%  V %.0f%%   ->  final S %.0f%%  V %.0f%%',
     hh * 360, ss * 100, vv * 100, PAL.s * 100, PAL.v * 100))
 
-  -- pré-visualização ao vivo (animação própria, independe do player)
+  -- pré-visualização ao vivo (usa o espectro real quando tocando, ou demo senoidal parado)
   for i = 1, BARS do
-    local val = 0.5 + 0.5 * math.sin(clock * (1.5 + i * 0.37) + i)
-    demoL[i] = val * (1 - 0.5 * (i - 1) / BARS)
-    demoP[i] = math.min(1, demoL[i] + 0.12)
+    if state == 'playing' then
+      demoL[i] = lvl[i]
+      demoP[i] = peak[i]
+    else
+      local val = 0.5 + 0.5 * math.sin(clock * (1.5 + i * 0.37) + i)
+      demoL[i] = val * (1 - 0.5 * (i - 1) / BARS)
+      demoP[i] = math.min(1, demoL[i] + 0.12)
+    end
   end
 
-  -- usa escala 1 e origem no cursor, sem herdar a escala do player
   local o = ui.getCursor()
   local sSX, sSY, sOX, sOY = SX, SY, OX, OY
   SX, SY = 1, 1
@@ -858,18 +1078,63 @@ function script.windowConfig(dt)
   ui.dummy(vec2(w, 70))
 
   ui.separator()
-  ui.text('PULSO DO VISUALIZADOR')
+  ui.text('ESPECTRO REAL (FFMPEG)')
+  if ui.checkbox('Usar ffmpeg (espectro no ritmo real da musica)', cfg.realSpectrum) then
+    cfg.realSpectrum = not cfg.realSpectrum
+    local tr = currentTrack()
+    if tr then startAnalysis(tr) end
+  end
+  ui.setNextItemWidth(w)
+  local ffp = ui.inputText('##ffp', cfg.ffmpeg)
+  if type(ffp) == 'string' and ffp ~= cfg.ffmpeg then cfg.ffmpeg = ffp end
+  ui.setNextItemWidth(w)
+  v, ch = ui.slider('##sen', cfg.sensitivity, -12, 30, 'Sensibilidade FFT: %.0f dB')
+  if ch then cfg.sensitivity = math.floor(v + 0.5) end
+  if ui.button('Reprocessar faixa atual', vec2(w, 0)) then
+    local tr = currentTrack()
+    if tr then startAnalysis(tr) end
+  end
+
+  local statusMsg = ''
+  if not cfg.realSpectrum then statusMsg = 'Status: FFmpeg desligado (usando modo pseudo-ritmico)'
+  elseif pcm.status == 'ready' then statusMsg = 'Status: Espectro real ativo (FFT)'
+  elseif pcm.status == 'decoding' then statusMsg = 'Status: Decodificando faixa de audio...'
+  elseif pcm.status == 'missing' then statusMsg = 'Status: ffmpeg.exe nao encontrado em ' .. cfg.ffmpeg
+  elseif pcm.status == 'error' then statusMsg = 'Status: Erro no ffmpeg (' .. pcm.msg .. ')'
+  else statusMsg = 'Status: Aguardando musica tocar' end
+  ui.textWrapped(statusMsg)
+
+  ui.separator()
+  ui.text('PULSO DO VISUALIZADOR (FALLBACK PSEUDO-RITMICO)')
   ui.setNextItemWidth(w)
   v, ch = ui.slider('##bpm', cfg.bpmManual, 0, 200, cfg.bpmManual < 60 and 'BPM: automatico' or 'BPM: %.0f')
   if ch then cfg.bpmManual = (v < 60) and 0 or math.floor(v + 0.5) end
   ui.setNextItemWidth(w)
   v, ch = ui.slider('##int', cfg.intensity * 100, 30, 150, 'Intensidade: %.0f%%')
   if ch then cfg.intensity = v / 100 end
-  ui.textWrapped('BPM automatico: usa "128 bpm" do nome do arquivo, se existir; senao gera um valor fixo por faixa. Abaixo de 60 = automatico.')
+  ui.textWrapped('Usado quando o FFmpeg esta desligado ou enquanto a faixa ainda esta sendo decodificada.')
 end
+
+-- Aliases globais para compatibilidade com qualquer configuração de manifest.ini
+windowMain = script.windowMain
+windowPlaylist = script.windowPlaylist
+windowConfig = script.windowConfig
+update = script.update
 
 --------------------------------------------------------------------------------
 -- inicialização
 --------------------------------------------------------------------------------
+pcall(io.createDir, CACHE)
+for _, f in ipairs(safe(function() return io.scanDir(CACHE, '*.pcm') end) or {}) do
+  pcall(io.deleteFile, CACHE .. '/' .. f)
+end
+
+initFFT()
+if not fileExists(cfg.ffmpeg) then
+  local alt = APP_DIR .. '/bin/ffmpeg.exe'
+  if fileExists(alt) then cfg.ffmpeg = alt end
+end
+
+math.randomseed(os.time())
 rescan()
 updatePalette()
