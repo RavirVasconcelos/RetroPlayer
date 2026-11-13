@@ -1,0 +1,5 @@
+Não instale pelo Content Manager.
+
+copie as pasta dentro das paste do jogo.
+
+Após copiar as pastas, pode ser possível colocar as musicas e criar subpastas pra colocar musicas especificas dentro da pasta de "music"
