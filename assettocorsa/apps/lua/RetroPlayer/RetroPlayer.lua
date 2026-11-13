@@ -1,8 +1,9 @@
 --------------------------------------------------------------------------------
--- RETRO PLAYER v4.2 - app Lua (CSP) para Assetto Corsa
--- Visual e skins da v3.2 + Espectro Real FFT via FFmpeg da v4.1 (com fallback)
--- MP3/M4A/AAC/WAV | estações por pasta | skins Winamp / Rádio automotivo
--- cor RGB + saturação + brilho | janela 100% responsiva
+-- RETRO PLAYER v4.3 - app Lua (CSP) para Assetto Corsa
+-- 4 Skins: Winamp | Rádio Automotivo | BZR Studio | AIMP Deck
+-- Espectro Real FFT via FFmpeg (v4.1) + Fallback Pseudo-Rítmico (v3.2)
+-- MP3/M4A/AAC/WAV | estações por pasta | cor RGB + saturação + brilho
+-- Janela 100% responsiva (escala automática preservando proporção)
 --------------------------------------------------------------------------------
 
 local EXTENSIONS = { mp3 = true, m4a = true, wav = true, aac = true }
@@ -79,7 +80,7 @@ local cfg = ac.storage{
   repeatAll = true,
   folder = 1,
   showRemaining = false,
-  skin = 1,                 -- 1 = Winamp, 2 = Rádio
+  skin = 1,                 -- 1 = Winamp, 2 = Rádio, 3 = BZR Studio, 4 = AIMP Deck
   colR = 209, colG = 115, colB = 255,
   sat = 1.0,                -- multiplicador de saturação (0..2)
   bright = 1.0,             -- multiplicador de brilho (0.3..1.5)
@@ -88,6 +89,7 @@ local cfg = ac.storage{
   realSpectrum = true,      -- usa FFT via ffmpeg quando disponível
   ffmpeg = APP_DIR .. '/bin/ffmpeg.exe',
   sensitivity = 6,          -- ganho em dB do espectro real
+  eqPreset = 1,             -- preset visual (AIMP / BZR)
 }
 
 local function hashStr(s)
@@ -101,8 +103,16 @@ local function fmtTime(t)
   return string.format('%02d:%02d', math.min(99, math.floor(t / 60)), t % 60)
 end
 
+local function fmtTimeLong(t)
+  t = math.max(0, math.floor(t))
+  local h = math.floor(t / 3600)
+  local m = math.floor((t % 3600) / 60)
+  local s = t % 60
+  return string.format('%02d:%02d:%02d', math.min(99, h), m, s)
+end
+
 --------------------------------------------------------------------------------
--- COR: RGB -> HSV -> paleta (v3.2)
+-- COR: RGB -> HSV -> paleta
 --------------------------------------------------------------------------------
 local function rgb2hsv(r, g, b)
   local mx, mn = math.max(r, g, b), math.min(r, g, b)
@@ -156,6 +166,17 @@ local function updatePalette()
   PAL.peak    = hsv(h, s * 0.3, 1)
   PAL.seekA   = hsv(h, s * 1.5, v * 0.55)
   PAL.seekB   = hsv(h, s * 0.9, v)
+
+  -- Cores do visor LCD retroiluminado (Skin 3: BZR Studio)
+  PAL.lcdTop   = hsv(h, clamp01(s * 0.46), clamp01(0.56 + v * 0.24))
+  PAL.lcdBot   = hsv(h, clamp01(s * 0.54), clamp01(0.46 + v * 0.20))
+  PAL.lcdInk   = hsv(h, clamp01(s * 0.90), 0.09)
+  PAL.lcdMid   = hsv(h, clamp01(s * 0.80), 0.22, 0.85)
+  PAL.lcdGhost = hsv(h, clamp01(s * 0.55), 0.38, 0.24)
+
+  -- Cores de destaque metálico/botões (Skin 4: AIMP Deck)
+  PAL.aimpBtnHi = hsv(h, clamp01(s * 0.85), clamp01(math.max(0.65, v)))
+  PAL.aimpBtnLo = hsv(h, clamp01(s * 1.10), clamp01(math.max(0.35, v * 0.58)))
 end
 
 local function palA(a) return hsv(PAL.h, PAL.s, PAL.v, a) end
@@ -602,7 +623,7 @@ function script.update(dt)
 end
 
 --------------------------------------------------------------------------------
--- helpers de desenho (com escala - v3.2)
+-- helpers de desenho (com escala)
 --------------------------------------------------------------------------------
 local DW, DH = 560, 190           -- dimensões de projeto do player
 local SX, SY = 1, 1               -- escala atual
@@ -615,8 +636,8 @@ local function rect(x1, y1, x2, y2, col, r)
   ui.drawRectFilled(P(x1, y1), P(x2, y2), col, (r or 0) * SX)
 end
 
-local function border(x1, y1, x2, y2, col, th)
-  ui.drawRect(P(x1, y1), P(x2, y2), col, 0, nil, math.max(0.6, (th or 1) * SX))
+local function border(x1, y1, x2, y2, col, th, r)
+  ui.drawRect(P(x1, y1), P(x2, y2), col, (r or 0) * SX, nil, math.max(0.6, (th or 1) * SX))
 end
 
 local function txt(s, size, x, y, col)
@@ -639,7 +660,7 @@ local SEG = {
   ['-'] = 'g', [' '] = '',
 }
 
-local function drawDigit(ch, x, y, w, h, t)
+local function drawDigitCustom(ch, x, y, w, h, t, colOn, colOff, colGlow)
   local mid = y + h / 2
   local R = {
     a = { x + t, y, x + w - t, y + t },
@@ -653,27 +674,33 @@ local function drawDigit(ch, x, y, w, h, t)
   local on = SEG[ch] or ''
   for name, r in pairs(R) do
     if on:find(name, 1, true) then
-      rect(r[1] - 1.5, r[2] - 1.5, r[3] + 1.5, r[4] + 1.5, PAL.glow, 2)
-      rect(r[1], r[2], r[3], r[4], PAL.on, 1)
+      if colGlow then
+        rect(r[1] - 1.5, r[2] - 1.5, r[3] + 1.5, r[4] + 1.5, colGlow, 2)
+      end
+      rect(r[1], r[2], r[3], r[4], colOn, 1)
+    elseif colOff then
+      rect(r[1], r[2], r[3], r[4], colOff, 1)
+    end
+  end
+end
+
+local function drawSeg7Custom(text, x, y, dw, dh, t, gap, colOn, colOff, colGlow)
+  local cx = x
+  for i = 1, #text do
+    local ch = text:sub(i, i)
+    if ch == ':' then
+      rect(cx + 3, y + dh * 0.28, cx + 3 + t, y + dh * 0.28 + t, colOn, 1)
+      rect(cx + 3, y + dh * 0.72 - t, cx + 3 + t, y + dh * 0.72, colOn, 1)
+      cx = cx + t + 7
     else
-      rect(r[1], r[2], r[3], r[4], PAL.segOff, 1)
+      drawDigitCustom(ch, cx, y, dw, dh, t, colOn, colOff, colGlow)
+      cx = cx + dw + gap
     end
   end
 end
 
 local function drawSeg7(text, x, y, dw, dh, t, gap)
-  local cx = x
-  for i = 1, #text do
-    local ch = text:sub(i, i)
-    if ch == ':' then
-      rect(cx + 3, y + dh * 0.28, cx + 3 + t, y + dh * 0.28 + t, PAL.on, 1)
-      rect(cx + 3, y + dh * 0.72 - t, cx + 3 + t, y + dh * 0.72, PAL.on, 1)
-      cx = cx + t + 7
-    else
-      drawDigit(ch, cx, y, dw, dh, t)
-      cx = cx + dw + gap
-    end
-  end
+  drawSeg7Custom(text, x, y, dw, dh, t, gap, PAL.on, PAL.segOff, PAL.glow)
 end
 
 local function drawSpectrum(x, y, w, h, segs, gap, L, PK)
@@ -746,7 +773,11 @@ local function iconPlayPause(cx, cy, c)
 end
 local function iconDirPrev(cx, cy, c) ui.drawTriangleFilled(P(cx + 4, cy - 6), P(cx + 4, cy + 6), P(cx - 5, cy), c) end
 local function iconDirNext(cx, cy, c) ui.drawTriangleFilled(P(cx - 4, cy - 6), P(cx - 4, cy + 6), P(cx + 5, cy), c) end
-local function iconText(s) return function(cx, cy, c) ctext(s, 12, cx, cy, c) end end
+local function iconEject(cx, cy, c)
+  ui.drawTriangleFilled(P(cx, cy - 6), P(cx - 6, cy + 1), P(cx + 6, cy + 1), c)
+  rect(cx - 6, cy + 3, cx + 6, cy + 6, c)
+end
+local function iconText(s, sz) return function(cx, cy, c) ctext(s, sz or 12, cx, cy, c) end end
 local iconShuf, iconRep = iconText('SHUF'), iconText('REP')
 local iconDirM, iconDirP = iconText('DIR-'), iconText('DIR+')
 
@@ -858,7 +889,6 @@ local function drawKnob(cx, cy, r)
   ui.drawLine(P(cx + math.cos(a) * r * 0.35, cy + math.sin(a) * r * 0.35),
               P(cx + math.cos(a) * r * 0.85, cy + math.sin(a) * r * 0.85), PAL.on, math.max(1, 3 * SX))
 
-  -- arrastar/roda do mouse = volume | clique = play/pause
   ui.setCursor(P(cx - r, cy - r))
   local clicked = ui.invisibleButton('knob', vec2(r * 2 * SX, r * 2 * SY))
   local act, hov = ui.itemActive(), ui.itemHovered()
@@ -948,6 +978,471 @@ local function drawRadio()
 end
 
 --------------------------------------------------------------------------------
+-- SKIN 3: BZR STUDIO (inspirada no BZR Player & @MAX Tray Player)
+--------------------------------------------------------------------------------
+local function vsliderBZR(id, x, y, w, h, value, label)
+  ui.setCursor(P(x - 6, y - 4))
+  local released = ui.invisibleButton(id, vec2((w + 12) * SX, (h + 8) * SY))
+  local active = ui.itemActive()
+  local hov = ui.itemHovered()
+  local frac
+  if active or released then
+    local my = (ui.mouseLocalPos().y - OY) / math.max(0.001, SY) - y
+    frac = clamp01(1 - my / h)
+  elseif hov then
+    local wh = ui.mouseWheel()
+    if wh ~= 0 then frac = clamp01(value + wh * 0.05) end
+  end
+  local v = frac or value
+
+  if label then ctext(label, 8.5, x + w / 2, y - 8, rgbm(0.76, 0.78, 0.82, 0.88)) end
+
+  -- Régua graduada lateral
+  for t = 0, 10 do
+    local ty = y + (t / 10) * h
+    local len = (t % 5 == 0) and 6 or 3.5
+    ui.drawLine(P(x - len - 2, ty), P(x - 2, ty), rgbm(0.10, 0.11, 0.13, 0.9), math.max(0.8, SX))
+    ui.drawLine(P(x + w + 2, ty), P(x + w + 2 + len, ty), rgbm(0.10, 0.11, 0.13, 0.9), math.max(0.8, SX))
+  end
+
+  -- Trilho fundo
+  local cx = x + w / 2
+  rect(cx - 2.5, y, cx + 2.5, y + h, rgbm(0.05, 0.06, 0.08, 1), 1)
+  border(cx - 2.5, y, cx + 2.5, y + h, rgbm(1, 1, 1, 0.12), 1)
+
+  -- Cap do fader (estilo mesa de som BZR)
+  local cy = y + (1 - v) * h
+  local kw, kh = 18, 11
+  rect(cx - kw / 2, cy - kh / 2 + 2, cx + kw / 2, cy + kh / 2 + 2, rgbm(0, 0, 0, 0.65), 2)
+  ui.drawRectFilledMultiColor(
+    P(cx - kw / 2, cy - kh / 2), P(cx + kw / 2, cy + kh / 2),
+    rgbm(0.32, 0.34, 0.38, 1), rgbm(0.32, 0.34, 0.38, 1),
+    rgbm(0.10, 0.11, 0.14, 1), rgbm(0.10, 0.11, 0.14, 1)
+  )
+  border(cx - kw / 2, cy - kh / 2, cx + kw / 2, cy + kh / 2, rgbm(0, 0, 0, 0.9), 1)
+  ui.drawLine(P(cx - kw / 2 + 2, cy), P(cx + kw / 2 - 2, cy), PAL.on, math.max(1.2, 1.5 * SX))
+
+  return frac, released, active or (hov and frac ~= nil)
+end
+
+local function ledRadioBZR(id, x, y, label, lit)
+  ui.setCursor(P(x - 4, y - 7))
+  local clicked = ui.invisibleButton(id, vec2(96 * SX, 14 * SY))
+  local r = 5.5
+  ui.drawCircleFilled(P(x + r, y), r * SX, rgbm(0.12, 0.13, 0.16, 1), 16)
+  ui.drawCircle(P(x + r, y), r * SX, rgbm(0.03, 0.03, 0.05, 1), 16, math.max(1, 1.3 * SX))
+  if lit then
+    ui.drawCircleFilled(P(x + r, y), (r + 2.5) * SX, PAL.glow, 16)
+    ui.drawCircleFilled(P(x + r, y), (r - 2) * SX, PAL.on, 16)
+  else
+    ui.drawCircleFilled(P(x + r, y), (r - 2.5) * SX, rgbm(0.24, 0.25, 0.28, 1), 12)
+  end
+  txt(label, 8.5, x + r * 2 + 5, y - 5, lit and PAL.text or rgbm(0.75, 0.77, 0.82, 0.82))
+  return clicked
+end
+
+local function seekBarBZR(x, y, w, h)
+  local cur, dur = playbackTimes()
+  local val = (dur > 0) and clamp01(cur / dur) or 0
+  ui.setCursor(P(x, y - 5))
+  local released = ui.invisibleButton('seek_bzr', vec2(w * SX, (h + 10) * SY))
+  local active = ui.itemActive()
+  local frac
+  if active or released then
+    local mx = (ui.mouseLocalPos().x - OX) / math.max(0.001, SX) - x
+    frac = clamp01(mx / w)
+  end
+  local v = frac or val
+  local cy = y + h / 2
+
+  -- Marcações da régua horizontal
+  for i = 0, 44 do
+    local tx = x + (i / 44) * w
+    local th = (i % 4 == 0) and 5 or 2.5
+    ui.drawLine(P(tx, cy - th - 2), P(tx, cy + th + 2), rgbm(0.14, 0.15, 0.18, 0.9), math.max(0.8, SX))
+  end
+
+  rect(x, cy - 2, x + w, cy + 2, rgbm(0.04, 0.04, 0.06, 1), 1)
+  ui.drawLine(P(x, cy), P(x + w * v, cy), PAL.on, math.max(1.2, 1.8 * SX))
+
+  local kx = x + w * v
+  rect(kx - 6, y - 2, kx + 6, y + h + 2, rgbm(0.12, 0.13, 0.16, 1), 2)
+  border(kx - 6, y - 2, kx + 6, y + h + 2, rgbm(0, 0, 0, 0.95), 1.2)
+  ui.drawLine(P(kx, y), P(kx, y + h), PAL.on, math.max(1.2, 2 * SX))
+
+  if released and frac and player and dur > 0 and state ~= 'stopped' then
+    pcall(function() player:setCurrentTime(frac * dur) end)
+  end
+end
+
+local function roundBtnBZR(id, cx, cy, r, icon, lit)
+  ui.setCursor(P(cx - r, cy - r))
+  local clicked = ui.invisibleButton(id, vec2(r * 2 * SX, r * 2 * SY))
+  local hov, act = ui.itemHovered(), ui.itemActive()
+
+  ui.drawCircleFilled(P(cx, cy), (r + 2.5) * SX, rgbm(0.05, 0.05, 0.07, 0.95), 32)
+  if lit or hov then
+    ui.drawCircleFilled(P(cx, cy), (r + 4.5) * SX, PAL.glow, 32)
+    ui.drawCircle(P(cx, cy), (r + 1.2) * SX, lit and PAL.on or PAL.border, 32, math.max(1.2, 2 * SX))
+  else
+    ui.drawCircle(P(cx, cy), (r + 1) * SX, rgbm(0.28, 0.30, 0.34, 0.8), 32, math.max(1, 1.2 * SX))
+  end
+
+  local baseCol = act and rgbm(0.12, 0.13, 0.16, 1) or (hov and rgbm(0.25, 0.27, 0.31, 1) or rgbm(0.19, 0.20, 0.24, 1))
+  ui.drawCircleFilled(P(cx, cy), (r - 1) * SX, baseCol, 32)
+  ui.drawCircleFilled(P(cx - r * 0.22, cy - r * 0.25), r * 0.42 * SX, rgbm(1, 1, 1, 0.06), 20)
+
+  icon(cx, cy, lit and PAL.on or rgbm(0.84, 0.86, 0.90, 1))
+  return clicked
+end
+
+local function drawBZR()
+  local tr, cat = currentTrack(), library[cfg.folder]
+  local cur, dur = playbackTimes()
+  local shown = cfg.showRemaining and math.max(0, dur - cur) or cur
+
+  -- Chassi de metal escovado escuro
+  fillBody(rgbm(0.36, 0.37, 0.40, 1), rgbm(0.18, 0.19, 0.21, 1), 0.18)
+  for yy = 4, 186, 3 do
+    ui.drawLine(P(0, yy), P(DW, yy), rgbm(1, 1, 1, (yy % 6 == 0) and 0.025 or 0.01), math.max(0.8, SX))
+  end
+
+  -- Barra superior BZR / @MAX
+  ui.drawRectFilledMultiColor(
+    P(0, 0), P(DW, 17),
+    rgbm(0.46, 0.47, 0.50, 1), rgbm(0.46, 0.47, 0.50, 1),
+    rgbm(0.24, 0.25, 0.28, 1), rgbm(0.24, 0.25, 0.28, 1)
+  )
+  ui.drawLine(P(0, 17), P(DW, 17), rgbm(0.06, 0.06, 0.08, 0.9), math.max(1, SX))
+  txt('@MAX / BZR STUDIO', 9.5, 12, 2, rgbm(0.86, 0.88, 0.92, 0.85))
+  ctext('B Z R   P L A Y E R', 10.5, 280, 8.5, rgbm(0.14, 0.15, 0.17, 0.95))
+
+  -- Moldura afundada e visor LCD retroiluminado (esquerda: 14, 22 -> 348, 114)
+  rect(12, 20, 350, 116, rgbm(0.08, 0.09, 0.11, 1), 3)
+  ui.drawRectFilledMultiColor(P(14, 22), P(348, 114), PAL.lcdTop, PAL.lcdTop, PAL.lcdBot, PAL.lcdBot)
+  border(14, 22, 348, 114, rgbm(0.04, 0.05, 0.06, 0.95), 2)
+
+  -- Mini janela escura estilo @MAX Tray Player (20Hz - 20kHz + dB)
+  rect(20, 27, 138, 86, rgbm(0.05, 0.06, 0.08, 0.92), 2)
+  border(20, 27, 138, 86, PAL.border, 1)
+  txt('dB', 8, 23, 30, PAL.dim)
+  if state == 'playing' then
+    ui.drawTriangleFilled(P(38, 31), P(38, 39), P(45, 35), PAL.on)
+  else
+    rect(38, 31, 44, 38, PAL.dim)
+  end
+  txt(eqModeText(false), 8.5, 50, 30, PAL.text)
+  txt('20HZ', 7.5, 23, 75, PAL.dim)
+  txt('20KHZ', 7.5, 106, 75, PAL.dim)
+
+  -- Mini analisador de 24 barras com picos dentro da janela @MAX
+  local gMini = grad(10)
+  local mbw = 108 / BARS
+  for i = 1, BARS do
+    local bx = 25 + (i - 1) * mbw
+    local bh = lvl[i] * 30
+    local colIdx = clamp(math.ceil(lvl[i] * 10), 1, 10)
+    if bh > 1 then
+      rect(bx, 72 - bh, bx + mbw - 1, 72, gMini[colIdx])
+    end
+    local pky = 72 - peak[i] * 30
+    rect(bx, pky - 1.5, bx + mbw - 1, pky, PAL.peak)
+  end
+
+  -- Relógio 7 segmentos estilo cristal líquido (com dígitos fantasma 88:88)
+  drawSeg7Custom('88:88', 214, 27, 21, 36, 4.5, 5, PAL.lcdGhost, PAL.lcdGhost, nil)
+  if cfg.showRemaining then
+    rect(200, 43, 209, 47, PAL.lcdInk, 1)
+  end
+  drawSeg7Custom(fmtTime(shown), 214, 27, 21, 36, 4.5, 5, PAL.lcdInk, PAL.lcdGhost, nil)
+  ui.setCursor(P(198, 25))
+  if ui.invisibleButton('bzr_time', vec2(146 * SX, 40 * SY)) then
+    cfg.showRemaining = not cfg.showRemaining
+  end
+
+  -- Linha de osciloscópio (forma de onda viva cruzando o visor LCD)
+  local waveY = 68
+  local prevX, prevY = 142, waveY
+  local segsW = 36
+  for s = 1, segsW do
+    local fx = s / segsW
+    local wx = 142 + fx * 202
+    local bIdx = clamp(math.floor(fx * BARS) + 1, 1, BARS)
+    local amp = (state == 'playing') and (lvl[bIdx] * 11 * math.sin(clock * 26 + s * 1.35)) or 0
+    local wy = clamp(waveY + amp, 54, 82)
+    ui.drawLine(P(prevX, prevY), P(wx, wy), PAL.lcdInk, math.max(1, 1.3 * SX))
+    prevX, prevY = wx, wy
+  end
+
+  -- Metadados técnicos no LCD
+  txt('ST: ' .. (cat and cat.name:sub(1, 12) or 'NENHUMA'), 9, 144, 28, PAL.lcdMid)
+  txt('KHZ: 44.1  ' .. (tr and tr.ext or 'MP3'), 9, 144, 41, PAL.lcdMid)
+  txt(string.format('TRK: %02d/%02d  [%s]', current, cat and #cat.tracks or 0, eqModeText(true)), 9, 144, 78, PAL.lcdInk)
+
+  -- Faixa inferior do LCD com marquee da música
+  rect(18, 93, 344, 111, rgbm(0, 0, 0, 0.14), 1)
+  drawMarquee(marqueeText() .. ' (' .. fmtTime(dur) .. ')', 11.5, 22, 95, 340, 110, PAL.lcdInk)
+
+  -- Faders verticais de estúdio (INTENS e VOLUME)
+  local intF, _, intAct = vsliderBZR('bzr_int', 368, 34, 16, 72, clamp01((cfg.intensity - 0.3) / 1.2), 'INTENS')
+  if intF and intAct then cfg.intensity = 0.3 + intF * 1.2 end
+
+  local volF, _, volAct = vsliderBZR('bzr_vol', 410, 34, 16, 72, cfg.volume, 'VOLUME')
+  if volF and volAct then setVolume(volF) end
+
+  -- 4 LEDs de status clicáveis à direita
+  if ledRadioBZR('bzr_fft', 446, 36, 'FFT REAL', cfg.realSpectrum) then
+    cfg.realSpectrum = not cfg.realSpectrum
+    if tr then startAnalysis(tr) end
+  end
+  if ledRadioBZR('bzr_rem', 446, 55, 'REMAIN', cfg.showRemaining) then
+    cfg.showRemaining = not cfg.showRemaining
+  end
+  if ledRadioBZR('bzr_shf', 446, 74, 'SHUFFLE', cfg.shuffle) then
+    cfg.shuffle = not cfg.shuffle
+  end
+  if ledRadioBZR('bzr_rep', 446, 93, 'REPEAT', cfg.repeatAll) then
+    cfg.repeatAll = not cfg.repeatAll
+  end
+
+  -- Régua de Seek graduada + Seletor de pasta/estação à direita
+  seekBarBZR(16, 122, 332, 12)
+
+  rect(364, 117, 546, 139, rgbm(0.09, 0.10, 0.12, 1), 3)
+  border(364, 117, 546, 139, PAL.border, 1, 3)
+  if btn('bzr_dp', 366, 119, 22, 18, iconDirPrev) then stepFolder(-1) end
+  drawMarquee('ESTACAO: ' .. (cat and cat.name or 'SEM PASTA'), 10, 392, 121, 518, 136, PAL.text)
+  if btn('bzr_dn', 522, 119, 22, 18, iconDirNext) then stepFolder(1) end
+
+  -- Botões circulares de transporte com anel neon (estilo BZR Player)
+  local by = 163
+  if roundBtnBZR('bzr_prev', 36, by, 17, iconPrev, false) then prevTrack() end
+  if roundBtnBZR('bzr_play', 78, by, 19, iconPlay, state == 'playing') then doPlay() end
+  if roundBtnBZR('bzr_pause', 120, by, 17, iconPause, state == 'paused') then doPause() end
+  if roundBtnBZR('bzr_stop', 160, by, 17, iconStop, state == 'stopped') then stopPlayback() end
+  if roundBtnBZR('bzr_next', 200, by, 17, iconNext, false) then nextTrack(false) end
+
+  if roundBtnBZR('bzr_fprev', 242, by, 12, iconDirPrev, false) then stepFolder(-1) end
+  if roundBtnBZR('bzr_fnext', 270, by, 12, iconDirNext, false) then stepFolder(1) end
+
+  -- Botões auxiliares direitos (estilo PL / EQ / SK)
+  if roundBtnBZR('bzr_eqm', 428, by, 12, iconText('FFT', 8.5), cfg.realSpectrum) then
+    cfg.realSpectrum = not cfg.realSpectrum
+    if tr then startAnalysis(tr) end
+  end
+  if roundBtnBZR('bzr_shb', 458, by, 12, iconText('SHF', 8.5), cfg.shuffle) then
+    cfg.shuffle = not cfg.shuffle
+  end
+  if roundBtnBZR('bzr_rpb', 488, by, 12, iconText('REP', 8.5), cfg.repeatAll) then
+    cfg.repeatAll = not cfg.repeatAll
+  end
+  if roundBtnBZR('bzr_skn', 522, by, 12, iconText('SKN', 8.5), true) then
+    cfg.skin = (cfg.skin % 4) + 1
+  end
+end
+
+--------------------------------------------------------------------------------
+-- SKIN 4: AIMP DECK (inspirada no AIMP Classic & JetAudio)
+--------------------------------------------------------------------------------
+local EQ_PRESETS = { 'ROCK', 'POP', 'JAZZ', 'CLASSIC', 'FLAT' }
+
+local function sliderAimp(id, x, y, w, h, value, label)
+  ui.setCursor(P(x - 4, y - 6))
+  local released = ui.invisibleButton(id, vec2((w + 8) * SX, (h + 12) * SY))
+  local active = ui.itemActive()
+  local hov = ui.itemHovered()
+  local frac
+  if active or released then
+    local mx = (ui.mouseLocalPos().x - OX) / math.max(0.001, SX) - x
+    frac = clamp01(mx / w)
+  elseif hov then
+    local wh = ui.mouseWheel()
+    if wh ~= 0 then frac = clamp01(value + wh * 0.05) end
+  end
+  local v = frac or value
+
+  if label then txt(label, 8, x, y - 10, rgbm(0.22, 0.24, 0.28, 0.95)) end
+
+  -- Trilho escuro com preenchimento na cor do tema
+  rect(x, y, x + w, y + h, rgbm(0.20, 0.21, 0.24, 1), 2)
+  if v > 0.005 then
+    ui.drawRectFilledMultiColor(P(x, y), P(x + w * v, y + h), PAL.seekA, PAL.on, PAL.on, PAL.seekA)
+  end
+  border(x, y, x + w, y + h, rgbm(0.10, 0.11, 0.13, 0.9), 1, 2)
+
+  -- Alça retangular clara estilo AIMP Classic
+  local kx = x + w * v
+  rect(kx - 7, y - 3.5, kx + 7, y + h + 3.5, rgbm(0.95, 0.96, 0.98, 1), 2)
+  border(kx - 7, y - 3.5, kx + 7, y + h + 3.5, rgbm(0.18, 0.20, 0.24, 1), 1, 2)
+  ui.drawLine(P(kx, y - 1.5), P(kx, y + h + 1.5), PAL.on, math.max(1, 1.4 * SX))
+
+  return frac, released, active or (hov and frac ~= nil)
+end
+
+local function roundBtnAimp(id, cx, cy, r, icon, lit, metallic)
+  ui.setCursor(P(cx - r, cy - r))
+  local clicked = ui.invisibleButton(id, vec2(r * 2 * SX, r * 2 * SY))
+  local hov, act = ui.itemHovered(), ui.itemActive()
+
+  ui.drawCircleFilled(P(cx, cy + 1.5), (r + 1) * SX, rgbm(0, 0, 0, 0.35), 32)
+
+  if metallic then
+    local c1 = act and rgbm(0.55, 0.57, 0.60, 1) or (hov and rgbm(0.82, 0.84, 0.88, 1) or rgbm(0.72, 0.74, 0.78, 1))
+    ui.drawCircleFilled(P(cx, cy), r * SX, c1, 32)
+    ui.drawCircle(P(cx, cy), r * SX, rgbm(0.20, 0.22, 0.25, 1), 32, math.max(1, 1.3 * SX))
+    icon(cx, cy, rgbm(0.12, 0.13, 0.16, 1))
+  else
+    local cFill = act and PAL.aimpBtnLo or (hov and PAL.on or PAL.aimpBtnHi)
+    if lit then
+      ui.drawCircleFilled(P(cx, cy), (r + 3.5) * SX, PAL.glow, 32)
+    end
+    ui.drawCircleFilled(P(cx, cy), r * SX, cFill, 32)
+    ui.drawCircleFilled(P(cx - r * 0.22, cy - r * 0.25), r * 0.45 * SX, rgbm(1, 1, 1, 0.22), 20)
+    ui.drawCircle(P(cx, cy), r * SX, rgbm(0.10, 0.11, 0.14, 0.95), 32, math.max(1, 1.5 * SX))
+    icon(cx, cy, rgbm(0.06, 0.06, 0.08, 1))
+  end
+
+  return clicked
+end
+
+local function drawAimp()
+  local tr, cat = currentTrack(), library[cfg.folder]
+  local cur, dur = playbackTimes()
+  local shown = cfg.showRemaining and math.max(0, dur - cur) or cur
+
+  -- Corpo prateado metálico em dois tons (estilo AIMP Classic / JetAudio)
+  fillBody(rgbm(0.86, 0.87, 0.90, 1), rgbm(0.68, 0.70, 0.74, 1), 0.45)
+
+  -- Barra de título escura superior
+  ui.drawRectFilledMultiColor(
+    P(0, 0), P(DW, 17),
+    rgbm(0.32, 0.34, 0.38, 1), rgbm(0.32, 0.34, 0.38, 1),
+    rgbm(0.18, 0.19, 0.22, 1), rgbm(0.18, 0.19, 0.22, 1)
+  )
+  txt('RETRO DECK // JET-DSP', 9, 10, 2.5, rgbm(0.85, 0.87, 0.92, 0.85))
+  ctext('A I M P   D E C K', 10.5, 280, 8.5, PAL.on)
+  rect(538, 3, 552, 14, PAL.aimpBtnHi, 2)
+  border(538, 3, 552, 14, rgbm(0.08, 0.08, 0.10, 1), 1, 2)
+
+  -- Grande visor panorâmico escuro arredondado (12, 21 -> 548, 122)
+  rect(12, 21, 548, 122, rgbm(0.06, 0.07, 0.09, 1), 6)
+  border(12, 21, 548, 122, rgbm(0.25, 0.26, 0.30, 1), 2, 6)
+
+  -- Faixa superior de marquee no formato clássico do AIMP
+  rect(16, 24, 544, 43, rgbm(0.11, 0.12, 0.15, 1), 3)
+  ui.drawLine(P(16, 43), P(544, 43), rgbm(1, 1, 1, 0.08), math.max(1, SX))
+  local aimpTitle = tr
+    and string.format('%02d :: %s :: %s :: 44 kHz, 320 kbps', current, tr.title, tr.ext)
+    or '00 :: APERTE PLAY PARA INICIAR :: MP3 :: 44 kHz, 320 kbps'
+  drawMarquee(aimpTitle, 11.5, 20, 26, 540, 41, rgbm(0.95, 0.96, 0.98, 1))
+
+  -- Coluna esquerda de metadados técnicos (16, 46 -> 116, 118)
+  rect(16, 46, 116, 118, rgbm(0.10, 0.11, 0.13, 1), 2)
+  txt('320 KBPS', 8.5, 22, 50, PAL.text)
+  txt('44.1 KHZ', 8.5, 22, 62, PAL.dim)
+  txt('MODE: ' .. eqModeText(false), 8.5, 22, 74, PAL.on)
+  txt('> ' .. (cat and cat.name:sub(1, 10) or 'RAIZ'), 8.5, 22, 86, rgbm(0.80, 0.82, 0.86, 0.9))
+
+  -- Botões compactos SHUF e REP dentro da coluna esquerda
+  if btn('aimp_shf', 20, 100, 44, 15, iconText('SHUF', 8.5), cfg.shuffle) then cfg.shuffle = not cfg.shuffle end
+  if btn('aimp_rep', 68, 100, 44, 15, iconText('REP', 8.5), cfg.repeatAll) then cfg.repeatAll = not cfg.repeatAll end
+
+  -- Janela central de visualização Cyber Tunnel + JetAudio Tags (120, 46 -> 404, 118)
+  ui.drawRectFilledMultiColor(P(120, 46), P(404, 118), PAL.dispTop, PAL.dispTop, rgbm(0.01, 0.01, 0.02, 1), rgbm(0.01, 0.01, 0.02, 1))
+  border(120, 46, 404, 118, rgbm(0, 0, 0, 0.95), 1.5)
+
+  -- Efeito túnel cibernético ao fundo + espectro espelhado do centro para fora
+  local vcx, vcy = 262, 76
+  local bassPulse = (lvl[1] + lvl[2] + lvl[3]) / 3
+  for r = 1, 3 do
+    local radX = (22 + r * 26 + ((clock * 25) % 26)) * (0.9 + 0.15 * bassPulse)
+    local radY = radX * 0.36
+    border(vcx - radX, vcy - radY, vcx + radX, vcy + radY, palA(0.14), 1, 2)
+  end
+
+  local gVis = grad(12)
+  local halfW = 132 / BARS
+  for i = 1, BARS do
+    local hBar = lvl[i] * 44
+    local cIdx = clamp(math.ceil(lvl[i] * 12), 1, 12)
+    local dx = (i - 1) * halfW
+    if hBar > 1 then
+      rect(vcx - dx - halfW + 0.5, 99 - hBar, vcx - dx - 0.5, 99, gVis[cIdx])
+      rect(vcx + dx + 0.5, 99 - hBar, vcx + dx + halfW - 0.5, 99, gVis[cIdx])
+    end
+  end
+
+  -- Barra de presets estilo JetAudio na base do visualizador
+  rect(122, 102, 402, 116, rgbm(0.04, 0.05, 0.08, 0.9), 1)
+  local pw = 276 / #EQ_PRESETS
+  for i, name in ipairs(EQ_PRESETS) do
+    local px = 124 + (i - 1) * pw
+    local activeP = (cfg.eqPreset == i)
+    if activeP then
+      rect(px, 103, px + pw - 2, 115, PAL.on, 2)
+    end
+    ctext(name, 8, px + pw / 2 - 1, 109, activeP and rgbm(0.05, 0.05, 0.08, 1) or PAL.dim)
+    ui.setCursor(P(px, 102))
+    if ui.invisibleButton('aimp_eq_' .. i, vec2(pw * SX, 14 * SY)) then
+      cfg.eqPreset = i
+    end
+  end
+
+  -- Painel direito: Relógio duplo + Micro-espectro estilo AIMP (408, 46 -> 544, 118)
+  rect(408, 46, 544, 118, rgbm(0.08, 0.09, 0.11, 1), 2)
+  ui.drawCircle(P(424, 62), 9 * SX, PAL.dim, 20, math.max(1, 1.5 * SX))
+  ui.drawLine(P(424, 62), P(424, 56), PAL.on, math.max(1, 1.4 * SX))
+  ui.drawLine(P(424, 62), P(429, 62), PAL.on, math.max(1, 1.4 * SX))
+
+  drawSeg7Custom('88:88', 442, 50, 15, 25, 3.5, 4, PAL.segOff, PAL.segOff, nil)
+  drawSeg7Custom(fmtTime(shown), 442, 50, 15, 25, 3.5, 4, rgbm(0.95, 0.96, 0.98, 1), PAL.segOff, PAL.glow)
+  txt(fmtTimeLong(dur), 9.5, 442, 77, PAL.on)
+  ui.setCursor(P(412, 48))
+  if ui.invisibleButton('aimp_time', vec2(128 * SX, 38 * SY)) then
+    cfg.showRemaining = not cfg.showRemaining
+  end
+
+  -- Micro-grade de espectro no canto inferior direito do display
+  drawSpectrum(414, 91, 124, 24, 7, 1.5)
+
+  -- Barra de progresso estilo AIMP (16, 129, 528, 6)
+  local seekFrac = (dur > 0) and clamp01(cur / dur) or 0
+  local sf, sRel = sliderAimp('aimp_seek', 16, 129, 528, 6, seekFrac)
+  if sRel and sf and player and dur > 0 and state ~= 'stopped' then
+    pcall(function() player:setCurrentTime(sf * dur) end)
+  end
+
+  -- Painel inferior esculpido + Botões redondos vibrantes na cor do tema
+  ui.drawLine(P(12, 143), P(548, 143), rgbm(1, 1, 1, 0.55), math.max(1, SX))
+
+  local by = 164
+  if roundBtnAimp('aimp_play', 34, by, 18, iconPlay, state == 'playing', false) then doPlay() end
+  if roundBtnAimp('aimp_pause', 72, by, 14.5, iconPause, state == 'paused', false) then doPause() end
+  if roundBtnAimp('aimp_stop', 105, by, 14.5, iconStop, state == 'stopped', false) then stopPlayback() end
+  if roundBtnAimp('aimp_prev', 138, by, 14.5, iconPrev, false, false) then prevTrack() end
+  if roundBtnAimp('aimp_next', 171, by, 14.5, iconNext, false, false) then nextTrack(false) end
+  if roundBtnAimp('aimp_ej', 202, by, 11.5, iconEject, false, true) then stepFolder(1) end
+
+  -- Sliders horizontais de Volume e Intensidade/Ganho à direita
+  local vf, _, vAct = sliderAimp('aimp_vol', 236, 154, 118, 5, cfg.volume, string.format('VOLUME: %d%%', math.floor(cfg.volume * 100 + 0.5)))
+  if vf and vAct then setVolume(vf) end
+
+  local intNorm = clamp01((cfg.intensity - 0.3) / 1.2)
+  local inf, _, inAct = sliderAimp('aimp_int', 236, 175, 118, 5, intNorm, string.format('PULSE GAIN: %d%%', math.floor(cfg.intensity * 100 + 0.5)))
+  if inf and inAct then cfg.intensity = 0.3 + inf * 1.2 end
+
+  -- Seletor rápido de estações e botão circular de menu à direita
+  if roundBtnAimp('aimp_st', 384, by, 15, iconText('DIR', 9), false, false) then stepFolder(1) end
+
+  rect(408, 148, 546, 180, rgbm(0.14, 0.15, 0.18, 1), 3)
+  border(408, 148, 546, 180, rgbm(0.05, 0.05, 0.07, 1), 1.2, 3)
+  if btn('aimp_dp', 411, 151, 24, 26, iconDirPrev) then stepFolder(-1) end
+  ctext(cat and cat.name:sub(1, 10) or 'ESTACAO', 9.5, 477, 158, PAL.on)
+  ctext(string.format('FAIXA %02d/%02d', current, cat and #cat.tracks or 0), 8.5, 477, 170, PAL.text)
+  if btn('aimp_dn', 519, 151, 24, 26, iconDirNext) then stepFolder(1) end
+end
+
+--------------------------------------------------------------------------------
 -- JANELA PRINCIPAL (responsiva, corpo preenche a janela inteira)
 --------------------------------------------------------------------------------
 function script.windowMain(dt)
@@ -974,7 +1469,15 @@ function script.windowMain(dt)
   pcall(ui.pushClipRect, vec2(0, 0), vec2(winW, winH), false)
 
   ui.pushDWriteFont('Consolas')
-  if cfg.skin == 2 then drawRadio() else drawWinamp() end
+  if cfg.skin == 2 then
+    drawRadio()
+  elseif cfg.skin == 3 then
+    drawBZR()
+  elseif cfg.skin == 4 then
+    drawAimp()
+  else
+    drawWinamp()
+  end
   ui.popDWriteFont()
 
   pcall(ui.popClipRect)
@@ -1013,7 +1516,7 @@ function script.windowPlaylist(dt)
 end
 
 --------------------------------------------------------------------------------
--- JANELA DE CONFIGURAÇÃO (v3.2 + controles FFmpeg da v4.1)
+-- JANELA DE CONFIGURAÇÃO (4 Skins + RGB/HSV + controles FFmpeg)
 --------------------------------------------------------------------------------
 local PRESETS = {
   { 'Roxo', 209, 115, 255 }, { 'Azul', 70, 150, 255 }, { 'Vermelho', 255, 70, 90 },
@@ -1027,10 +1530,13 @@ function script.windowConfig(dt)
   local w = ui.availableSpaceX()
   local v, ch
 
-  ui.text('TEMA')
-  if ui.radioButton('Winamp', cfg.skin == 1) then cfg.skin = 1 end
+  ui.text('TEMA (4 SKINS)')
+  if ui.radioButton('1. Winamp Classic', cfg.skin == 1) then cfg.skin = 1 end
   ui.sameLine()
-  if ui.radioButton('Radio automotivo', cfg.skin == 2) then cfg.skin = 2 end
+  if ui.radioButton('2. Radio Automotivo', cfg.skin == 2) then cfg.skin = 2 end
+  if ui.radioButton('3. BZR Studio (@MAX)', cfg.skin == 3) then cfg.skin = 3 end
+  ui.sameLine()
+  if ui.radioButton('4. AIMP Deck (JetAudio)', cfg.skin == 4) then cfg.skin = 4 end
 
   ui.separator()
   ui.text('COR (RGB + saturacao)')
@@ -1053,7 +1559,7 @@ function script.windowConfig(dt)
   ui.text(string.format('Base: H %.0f  S %.0f%%  V %.0f%%   ->  final S %.0f%%  V %.0f%%',
     hh * 360, ss * 100, vv * 100, PAL.s * 100, PAL.v * 100))
 
-  -- pré-visualização ao vivo (usa o espectro real quando tocando, ou demo senoidal parado)
+  -- Pré-visualização ao vivo
   for i = 1, BARS do
     if state == 'playing' then
       demoL[i] = lvl[i]
